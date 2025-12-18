@@ -287,6 +287,7 @@ class InputData:
   organic_reach: xr.DataArray | None = None
   organic_frequency: xr.DataArray | None = None
   non_media_treatments: xr.DataArray | None = None
+  channel_ltv: dict | None = None
 
   def __post_init__(self):
     self._convert_geos_to_strings()
@@ -315,6 +316,11 @@ class InputData:
       return self._allocate_spend(self.media_spend, self.media)
     else:
       return self.media_spend
+
+  @property
+  def channel_level_ltv(self) -> dict | None:
+    """Returns the channel level LTV-- CUSTOM ATTRIBUTE"""
+    return self.channel_ltv
 
   @property
   def allocated_rf_spend(self) -> xr.DataArray | None:

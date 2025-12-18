@@ -1786,6 +1786,67 @@ class Analyzer:
 
     if use_kpi:
       return kpi
+
+    # Check if channel_level_ltv is available
+    channel_ltv = self._model_context.input_data.channel_level_ltv
+    if channel_ltv is not None:
+      # Verify media channels exist when channel_ltv is provided
+      if self._model_context.input_data.media_channel is None:
+        raise ValueError(
+            "channel_level_ltv is provided but no media channels are available. "
+            "Channel-level LTV requires media channel data."
+        )
+
+      # Get channel names in the order they appear in the kpi tensor
+      # The kpi tensor contains: media + RF + organic media + organic RF + non-media (if present)
+      # We need to build an LTV tensor matching this order
+      media_channels = self._model_context.input_data.media_channel.values
+
+      # Verify all media channels are present in channel_ltv
+      missing_channels = [
+          channel for channel in media_channels if channel not in channel_ltv
+      ]
+      if missing_channels:
+        raise ValueError(
+            f"The following media channels are missing from channel_level_ltv: "
+            f"{missing_channels}. All media channels must have corresponding LTV values."
+        )
+
+      # Get the number of channels in the kpi tensor
+      n_channels = kpi.shape[-1]
+
+      # Build channel list in the order they appear in kpi tensor:
+      # media, RF, organic media, organic RF, non-media (if present)
+      all_channels_in_order = []
+      if self._model_context.input_data.media_channel is not None:
+        all_channels_in_order.extend(self._model_context.input_data.media_channel.values)
+      if self._model_context.input_data.rf_channel is not None:
+        all_channels_in_order.extend(self._model_context.input_data.rf_channel.values)
+      if self._model_context.input_data.organic_media_channel is not None:
+        all_channels_in_order.extend(self._model_context.input_data.organic_media_channel.values)
+      if self._model_context.input_data.organic_rf_channel is not None:
+        all_channels_in_order.extend(self._model_context.input_data.organic_rf_channel.values)
+      if self._model_context.input_data.non_media_channel is not None:
+        all_channels_in_order.extend(self._model_context.input_data.non_media_channel.values)
+
+      # Create LTV tensor matching the full channel order
+      # Use LTV values for media channels, 1.0 for all other channels
+      channel_ltv_values = []
+      for channel_name in all_channels_in_order[:n_channels]:
+        if channel_name in channel_ltv:
+          channel_ltv_values.append(channel_ltv[channel_name])
+        else:
+          # Non-media channels (RF, organic, non-media treatments) use 1.0
+          channel_ltv_values.append(1.0)
+
+      channel_ltv_tensor = backend.to_tensor(
+          np.array(channel_ltv_values, dtype=np.float32)
+      )
+
+      # Multiply kpi by channel-level LTV: shape is ...gtm, multiply along m dimension
+      return backend.einsum("m,...gtm->...gtm", channel_ltv_tensor, kpi)
+
+    # Fallback to common revenue_per_kpi factor
     return backend.einsum("gt,...gtm->...gtm", revenue_per_kpi, kpi)
 
   @backend.function(
