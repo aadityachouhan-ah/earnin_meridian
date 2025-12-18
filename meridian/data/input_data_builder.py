@@ -72,6 +72,7 @@ class InputDataBuilder(abc.ABC):
     self._organic_reach: xr.DataArray = None
     self._organic_frequency: xr.DataArray = None
     self._non_media_treatments: xr.DataArray = None
+    self._channel_ltv: dict | None = None
 
   @property
   def time_coords(self) -> Sequence[str]:
@@ -595,6 +596,19 @@ class InputDataBuilder(abc.ABC):
         constants.TIME
     ].values.tolist()
 
+  @property
+  def channel_ltv(self) -> dict | None:
+    return self._channel_ltv
+
+  @channel_ltv.setter
+  def channel_ltv(self, channel_ltv: dict | None):
+    """Sets the `channel_ltv` dictionary.
+
+    Args:
+      channel_ltv: Channel LTV dictionary mapping channel names to LTV values.
+    """
+    self._channel_ltv = channel_ltv
+
   def build(self) -> input_data.InputData:
     """Builds an `InputData`.
 
@@ -640,6 +654,7 @@ class InputDataBuilder(abc.ABC):
         organic_media=_get_sorted(self.organic_media, True),
         organic_reach=_get_sorted(self.organic_reach, True),
         organic_frequency=_get_sorted(self.organic_frequency, True),
+        channel_ltv=self._channel_ltv,
     )
 
   def _normalize_coords(

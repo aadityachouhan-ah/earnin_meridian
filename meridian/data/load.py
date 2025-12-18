@@ -75,6 +75,7 @@ class XrDatasetDataLoader(InputDataLoader):
       dataset: xr.Dataset,
       kpi_type: str,
       name_mapping: Mapping[str, str] | None = None,
+      channel_ltv: dict| None = None,
   ):
     """Constructor.
 
@@ -171,6 +172,7 @@ class XrDatasetDataLoader(InputDataLoader):
         are thrown.
     """
     self.kpi_type = kpi_type
+    self.channel_ltv = channel_ltv
     if name_mapping is None:
       self.dataset = dataset
     else:
@@ -318,6 +320,8 @@ class XrDatasetDataLoader(InputDataLoader):
       builder.organic_reach = self.dataset.organic_reach
     if constants.ORGANIC_FREQUENCY in self.dataset.data_vars.keys():
       builder.organic_frequency = self.dataset.organic_frequency
+    if self.channel_ltv is not None:
+      builder.channel_ltv = self.channel_ltv
     return builder.build()
 
 
