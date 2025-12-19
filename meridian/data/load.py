@@ -585,6 +585,7 @@ class DataFrameDataLoader(InputDataLoader):
   rf_spend_to_channel: Mapping[str, str] | None = None
   organic_reach_to_channel: Mapping[str, str] | None = None
   organic_frequency_to_channel: Mapping[str, str] | None = None
+  channel_ltv: dict | None = None
 
   def __post_init__(self):
     # If [key] in the following dict exists as an attribute in
@@ -828,6 +829,9 @@ class DataFrameDataLoader(InputDataLoader):
           self.coord_to_columns.geo,
       )
 
+    if self.channel_ltv is not None:
+      builder.channel_ltv = self.channel_ltv
+
     return builder.build()
 
 
@@ -870,6 +874,7 @@ class CsvDataLoader(InputDataLoader):
       rf_spend_to_channel: Mapping[str, str] | None = None,
       organic_reach_to_channel: Mapping[str, str] | None = None,
       organic_frequency_to_channel: Mapping[str, str] | None = None,
+      channel_ltv: dict | None = None,
   ):
     """Constructor.
 
@@ -1008,6 +1013,7 @@ class CsvDataLoader(InputDataLoader):
         rf_spend_to_channel=rf_spend_to_channel,
         organic_reach_to_channel=organic_reach_to_channel,
         organic_frequency_to_channel=organic_frequency_to_channel,
+        channel_ltv=channel_ltv,
     )
 
   def load(self) -> input_data.InputData:
