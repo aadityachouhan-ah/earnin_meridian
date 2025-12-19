@@ -33,6 +33,7 @@ from meridian.model import model
 from meridian.templates import formatter
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 import xarray as xr
 
 
@@ -1323,9 +1324,10 @@ class BudgetOptimizer:
   results can be viewed as plots and as an HTML summary output page.
   """
 
-  def __init__(self, meridian: model.Meridian):
+  def __init__(self, meridian: model.Meridian, use_cpik_ltv_condition = True):
     self._meridian = meridian
     self._analyzer = analyzer_module.Analyzer(self._meridian)
+    self.use_cpik_ltv_condition = use_cpik_ltv_condition
 
   def _validate_model_fit(self, use_posterior: bool):
     """Validates that the model is fit."""
@@ -2568,6 +2570,21 @@ class BudgetOptimizer:
         dtype=np.float64,
     )
 
+  def apply_cpik_condition(self, incremental_outcome_grid, cpik_outcome_grid, spend_grid):
+    # Create a boolean mask where cpik_outcome_grid > 1
+    mask = cpik_outcome_grid > 1
+    incremental_outcome_grid[mask] = np.nan
+    spend_grid[mask] = np.nan
+    return incremental_outcome_grid, spend_grid
+
+  def get_cpik_from_inc_outputs(self, incremental_outcome_grid, step_size):
+    inc_grid = tf.convert_to_tensor(incremental_outcome_grid, dtype=tf.float32)
+    delta_inc_outcome = inc_grid[1:, :] - inc_grid[:-1, :]
+    cpik = tf.math.divide_no_nan(step_size, delta_inc_outcome)
+    nan_row = tf.fill([1, tf.shape(cpik)[1]], np.nan)
+    cpik_full = tf.concat([nan_row, cpik], axis=0)
+    return cpik_full.numpy()
+
   def _create_grids(
       self,
       spend: np.ndarray,
@@ -2676,6 +2693,9 @@ class BudgetOptimizer:
       incremental_outcome_grid = backend.stabilize_rf_roi_grid(
           spend_grid, incremental_outcome_grid, self._meridian.n_rf_channels
       )
+    if self.use_cpik_ltv_condition:
+      cpik_outcome_grid = self.get_cpik_from_inc_outputs(incremental_outcome_grid, step_size)
+      incremental_outcome_grid, spend_grid = self.apply_cpik_condition(incremental_outcome_grid, cpik_outcome_grid, spend_grid)
     return (spend_grid, incremental_outcome_grid)
 
   def _validate_optimization_tensors(
