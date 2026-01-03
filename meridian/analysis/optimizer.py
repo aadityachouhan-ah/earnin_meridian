@@ -122,6 +122,12 @@ class OptimizationGrid:
       a list of booleans indicating which time coordinates are selected.
       Otherwise, this is a list of strings indicating the time coordinates used
       in this grid.
+    cpik_grid: Optional ndarray of shape `(grid_length, n_paid_channels)`
+      containing the CPIK (cost per incremental KPI) at each grid point.
+      Used to apply LTV-based efficiency constraints during grid search.
+    cpik_threshold: Optional float or ndarray of shape `(n_paid_channels,)`
+      containing the CPIK threshold (LTV) per channel. Grid points where
+      CPIK exceeds this threshold will be excluded during optimization.
   """
 
   _grid_dataset: xr.Dataset
@@ -138,6 +144,8 @@ class OptimizationGrid:
   selected_geos: Sequence[str] | None
   selected_times: Sequence[str] | Sequence[bool] | None
   max_frequency: float | None = None
+  cpik_grid: np.ndarray | None = None
+  cpik_threshold: np.ndarray | float | None = None
 
   @property
   def grid_dataset(self) -> xr.Dataset:
@@ -414,6 +422,20 @@ class OptimizationGrid:
         where=(denominator != 0),
     )
     iterative_roi_grid = np.round(iterative_roi_grid, decimals=8)
+
+    # Apply CPIK/LTV constraint: mask out cells where CPIK exceeds threshold
+    # CPIK = delta_spend / delta_outcome = 1 / iterative_roi (when roi = outcome/spend)
+    # So CPIK > threshold means iterative_roi < 1/threshold
+    if self.cpik_grid is not None and self.cpik_threshold is not None:
+      # Use the trimmed cpik_grid (skip first row to match iterative_roi_grid shape)
+      cpik_values = self.cpik_grid[1:, :]
+      threshold = self.cpik_threshold
+      if isinstance(threshold, (int, float)):
+        threshold = np.full(cpik_values.shape[1], threshold)
+      # Mask out cells where CPIK exceeds the per-channel threshold
+      for ch_idx in range(cpik_values.shape[1]):
+        mask = cpik_values[:, ch_idx] > threshold[ch_idx]
+        iterative_roi_grid[mask, ch_idx] = np.nan
 
     while True:
       spend_optimal = spend.astype(int)
@@ -1324,10 +1346,30 @@ class BudgetOptimizer:
   results can be viewed as plots and as an HTML summary output page.
   """
 
-  def __init__(self, meridian: model.Meridian, use_cpik_ltv_condition = True):
+  def __init__(
+      self,
+      meridian: model.Meridian,
+      use_cpik_ltv_condition: bool = True,
+      cpik_threshold: np.ndarray | float | None = None,
+  ):
+    """Initializes the BudgetOptimizer.
+
+    Args:
+      meridian: The fitted Meridian model.
+      use_cpik_ltv_condition: If True, applies CPIK/LTV efficiency constraint
+        during optimization. Grid points where CPIK exceeds cpik_threshold
+        will be excluded from optimization.
+      cpik_threshold: The CPIK threshold (LTV) per channel. Can be a single
+        float (same for all channels) or an array of shape (n_paid_channels,).
+        If None and use_cpik_ltv_condition is True, defaults to 1.0.
+        For example, if your LTV is $125, set cpik_threshold=125 to exclude
+        grid points where acquiring one incremental KPI costs more than $125.
+    """
     self._meridian = meridian
     self._analyzer = analyzer_module.Analyzer(self._meridian)
     self.use_cpik_ltv_condition = use_cpik_ltv_condition
+    # Default to 1.0 if cpik_ltv is enabled but no threshold provided
+    self.cpik_threshold = cpik_threshold if cpik_threshold is not None else (1.0 if use_cpik_ltv_condition else None)
 
   def _validate_model_fit(self, use_posterior: bool):
     """Validates that the model is fit."""
@@ -2132,7 +2174,7 @@ class BudgetOptimizer:
       optimal_frequency = None
 
     step_size = 10 ** (-round_factor)
-    (spend_grid, incremental_outcome_grid) = self._create_grids(
+    (spend_grid, incremental_outcome_grid, cpik_grid) = self._create_grids(
         spend=hist_spend,
         spend_bound_lower=optimization_lower_bound,
         spend_bound_upper=optimization_upper_bound,
@@ -2165,6 +2207,8 @@ class BudgetOptimizer:
         optimal_frequency=optimal_frequency,
         selected_geos=selected_geos,
         selected_times=selected_times,
+        cpik_grid=cpik_grid,
+        cpik_threshold=self.cpik_threshold,
     )
 
   def _create_grid_dataset(
@@ -2693,10 +2737,12 @@ class BudgetOptimizer:
       incremental_outcome_grid = backend.stabilize_rf_roi_grid(
           spend_grid, incremental_outcome_grid, self._meridian.n_rf_channels
       )
+    # Compute CPIK grid for LTV-based efficiency constraint (applied during grid search)
+    # NOTE: We do NOT shrink the grid here - the constraint is applied during _grid_search
+    cpik_grid = None
     if self.use_cpik_ltv_condition:
-      cpik_outcome_grid = self.get_cpik_from_inc_outputs(incremental_outcome_grid, step_size)
-      incremental_outcome_grid, spend_grid = self.apply_cpik_condition(incremental_outcome_grid, cpik_outcome_grid, spend_grid)
-    return (spend_grid, incremental_outcome_grid)
+      cpik_grid = self.get_cpik_from_inc_outputs(incremental_outcome_grid, step_size)
+    return (spend_grid, incremental_outcome_grid, cpik_grid)
 
   def _validate_optimization_tensors(
       self,
