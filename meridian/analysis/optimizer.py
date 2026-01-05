@@ -2645,10 +2645,13 @@ class BudgetOptimizer:
     )
 
   def apply_cpik_condition(self, incremental_outcome_grid, cpik_outcome_grid, spend_grid):
-    # Create a boolean mask where cpik_outcome_grid > 1
+    # Create a boolean mask where cpik_outcome_grid > 1 (spend > revenue)
+    # Only NaN out incremental_outcome_grid, NOT spend_grid
+    # This ensures grid bounds remain valid for check_optimization_bounds
+    # while still excluding unprofitable spend levels from optimization
     mask = cpik_outcome_grid > 1
     incremental_outcome_grid[mask] = np.nan
-    spend_grid[mask] = np.nan
+    # Don't modify spend_grid - it breaks optimization bounds checking
     return incremental_outcome_grid, spend_grid
 
   def get_cpik_from_inc_outputs(self, incremental_outcome_grid, step_size):
