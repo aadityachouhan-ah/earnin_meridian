@@ -345,14 +345,19 @@ class OptimizationGrid:
       if updated_cpik is not None:
         updated_cpik[nan_indices:, ch] = np.nan
 
-    # Drop the rows with all NaN values.
+    # Drop the rows with all NaN values based on spend_grid only
+    # (incremental_outcome may have additional NaNs from CPIK filtering)
+    # Use spend_grid as the reference to keep grids aligned
     updated_spend = updated_spend.dropna(dim=c.GRID_SPEND_INDEX, how='all')
-    updated_incremental_outcome = updated_incremental_outcome.dropna(
-        dim=c.GRID_SPEND_INDEX, how='all'
+    n_rows = len(updated_spend)
+
+    # Trim incremental_outcome to match spend grid dimensions
+    updated_incremental_outcome = updated_incremental_outcome.isel(
+        {c.GRID_SPEND_INDEX: slice(0, n_rows)}
     )
+
     # Trim cpik_grid to match the spend grid dimensions
     if updated_cpik is not None:
-      n_rows = len(updated_spend)
       updated_cpik = updated_cpik[:n_rows, :]
 
     return (updated_spend, updated_incremental_outcome, updated_cpik)
