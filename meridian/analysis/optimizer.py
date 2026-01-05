@@ -443,18 +443,22 @@ class OptimizationGrid:
     )
     iterative_roi_grid = np.round(iterative_roi_grid, decimals=8)
 
-    # Apply CPIK/LTV constraint: mask out cells where CPIK exceeds threshold
-    # CPIK = delta_spend / delta_outcome = 1 / iterative_roi (when roi = outcome/spend)
-    # So CPIK > threshold means iterative_roi < 1/threshold
+    # Prepare CPIK constraint data
+    cpik_values = None
+    cpik_threshold_array = None
     if cpik_grid is not None and self.cpik_threshold is not None:
       # Use the trimmed cpik_grid (skip first row to match iterative_roi_grid shape)
       cpik_values = cpik_grid[1:, :]
-      threshold = self.cpik_threshold
-      if isinstance(threshold, (int, float)):
-        threshold = np.full(cpik_values.shape[1], threshold)
-      # Mask out cells where CPIK exceeds the per-channel threshold
+      cpik_threshold_array = self.cpik_threshold
+      if isinstance(cpik_threshold_array, (int, float)):
+        cpik_threshold_array = np.full(cpik_values.shape[1], cpik_threshold_array)
+
+    # Apply CPIK/LTV constraint: mask out cells where CPIK exceeds threshold
+    # CPIK = delta_spend / delta_outcome = 1 / iterative_roi (when roi = outcome/spend)
+    # So CPIK > threshold means iterative_roi < 1/threshold
+    if cpik_values is not None:
       for ch_idx in range(cpik_values.shape[1]):
-        mask = cpik_values[:, ch_idx] > threshold[ch_idx]
+        mask = cpik_values[:, ch_idx] > cpik_threshold_array[ch_idx]
         iterative_roi_grid[mask, ch_idx] = np.nan
 
     while True:
@@ -500,6 +504,12 @@ class OptimizationGrid:
       iterative_roi_grid[row_idx + 1 :, media_idx] = np.round(
           new_roi_col, decimals=8
       )
+
+      # Re-apply CPIK constraint to the newly computed ROI values
+      if cpik_values is not None:
+        mask = cpik_values[row_idx + 1 :, media_idx] > cpik_threshold_array[media_idx]
+        iterative_roi_grid[row_idx + 1 :, media_idx][mask] = np.nan
+
     return spend_optimal
 
 
