@@ -261,7 +261,7 @@ class OptimizationGrid:
           ' It is only a problem when you use a much smaller budget, '
           ' for which the intended step size is smaller. '
       )
-    (spend_grid, incremental_outcome_grid) = self.trim_grids(
+    (spend_grid, incremental_outcome_grid, trimmed_cpik_grid) = self.trim_grids(
         spend_bound_lower=optimization_lower_bound,
         spend_bound_upper=optimization_upper_bound,
     )
@@ -274,6 +274,7 @@ class OptimizationGrid:
         spend_grid=spend_grid,
         incremental_outcome_grid=incremental_outcome_grid,
         scenario=scenario,
+        cpik_grid=trimmed_cpik_grid,
     )
 
     return xr.Dataset(
@@ -288,7 +289,7 @@ class OptimizationGrid:
       self,
       spend_bound_lower: np.ndarray,
       spend_bound_upper: np.ndarray,
-  ) -> tuple[xr.DataArray, xr.DataArray]:
+  ) -> tuple[xr.DataArray, xr.DataArray, np.ndarray | None]:
     """Trims the grids based on a more restricted spend bound.
 
     Args:
@@ -302,6 +303,8 @@ class OptimizationGrid:
       updated_incremental_outcome: The updated incremental outcome grid
         containing only the corresponding incremental outcome values for the
         updated spend grid.
+      updated_cpik: The updated cpik grid with the same trimming applied,
+        or None if cpik_grid is not set.
     """
     self.check_optimization_bounds(
         lower_bound=spend_bound_lower,
@@ -310,6 +313,8 @@ class OptimizationGrid:
     spend_grid = self.spend_grid
     updated_spend = self.spend_grid.copy()
     updated_incremental_outcome = self.incremental_outcome_grid.copy()
+    # Also trim cpik_grid if it exists
+    updated_cpik = self.cpik_grid.copy() if self.cpik_grid is not None else None
 
     for ch in range(len(self.channels)):
       valid_indices = np.where(
@@ -327,19 +332,30 @@ class OptimizationGrid:
       updated_incremental_outcome[:, ch] = np.roll(
           updated_incremental_outcome[:, ch], shift=-first_valid_index
       )
+      # Move the corresponding cpik values to the first row.
+      if updated_cpik is not None:
+        updated_cpik[:, ch] = np.roll(
+            updated_cpik[:, ch], shift=-first_valid_index
+        )
 
       # Fill the invalid indices with NaN.
       nan_indices = last_valid_index - first_valid_index + 1
       updated_spend[nan_indices:, ch] = np.nan
       updated_incremental_outcome[nan_indices:, ch] = np.nan
+      if updated_cpik is not None:
+        updated_cpik[nan_indices:, ch] = np.nan
 
     # Drop the rows with all NaN values.
     updated_spend = updated_spend.dropna(dim=c.GRID_SPEND_INDEX, how='all')
     updated_incremental_outcome = updated_incremental_outcome.dropna(
         dim=c.GRID_SPEND_INDEX, how='all'
     )
+    # Trim cpik_grid to match the spend grid dimensions
+    if updated_cpik is not None:
+      n_rows = len(updated_spend)
+      updated_cpik = updated_cpik[:n_rows, :]
 
-    return (updated_spend, updated_incremental_outcome)
+    return (updated_spend, updated_incremental_outcome, updated_cpik)
 
   def check_optimization_bounds(
       self,
@@ -386,6 +402,7 @@ class OptimizationGrid:
       spend_grid: xr.DataArray,
       incremental_outcome_grid: xr.DataArray,
       scenario: FixedBudgetScenario | FlexibleBudgetScenario,
+      cpik_grid: np.ndarray | None = None,
   ) -> np.ndarray:
     """Hill-climbing search algorithm for budget optimization.
 
@@ -397,6 +414,9 @@ class OptimizationGrid:
         `n_total_channels`) containing incremental outcome by channel for all
         media and RF channels, used in the hill-climbing search algorithm.
       scenario: The optimization scenario with corresponding parameters.
+      cpik_grid: Optional trimmed CPIK grid with the same dimensions as
+        spend_grid. If provided along with cpik_threshold, grid points where
+        CPIK exceeds the threshold will be excluded from optimization.
 
     Returns:
       `np.ndarray` of dimension (`n_total_channels`) containing the optimal
@@ -426,9 +446,9 @@ class OptimizationGrid:
     # Apply CPIK/LTV constraint: mask out cells where CPIK exceeds threshold
     # CPIK = delta_spend / delta_outcome = 1 / iterative_roi (when roi = outcome/spend)
     # So CPIK > threshold means iterative_roi < 1/threshold
-    if self.cpik_grid is not None and self.cpik_threshold is not None:
+    if cpik_grid is not None and self.cpik_threshold is not None:
       # Use the trimmed cpik_grid (skip first row to match iterative_roi_grid shape)
-      cpik_values = self.cpik_grid[1:, :]
+      cpik_values = cpik_grid[1:, :]
       threshold = self.cpik_threshold
       if isinstance(threshold, (int, float)):
         threshold = np.full(cpik_values.shape[1], threshold)
