@@ -2769,10 +2769,11 @@ class BudgetOptimizer:
       )
     # Compute CPIK grid for LTV-based efficiency constraint (applied during grid search)
     # NOTE: We do NOT shrink the grid here - the constraint is applied during _grid_search
-    cpik_grid = None
+    mroi_grid = None
     if self.use_cpik_ltv_condition:
-      cpik_grid = self.get_cpik_from_inc_outputs(incremental_outcome_grid, step_size)
-    return (spend_grid, incremental_outcome_grid, cpik_grid)
+      mroi_grid = self.get_cpik_from_inc_outputs(incremental_outcome_grid, step_size)
+      incremental_outcome_grid, spend_grid = self.apply_cpik_condition(incremental_outcome_grid, mroi_grid, spend_grid)
+    return (spend_grid, incremental_outcome_grid, mroi_grid)
 
   def _validate_optimization_tensors(
       self,
