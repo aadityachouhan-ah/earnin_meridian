@@ -39,6 +39,7 @@ import xarray as xr
 
 __all__ = [
     'BudgetOptimizer',
+    'MarginalCacOptimizationResults',
     'OptimizationGrid',
     'OptimizationResults',
     'FixedBudgetScenario',
@@ -459,6 +460,82 @@ class OptimizationGrid:
           new_roi_col, decimals=8
       )
     return spend_optimal
+
+
+@dataclasses.dataclass(frozen=True)
+class MarginalCacOptimizationResults:
+  """Results of `BudgetOptimizer.optimize_marginal_cac_to_rpc`.
+
+  This is the output of the per-channel marginal-CAC recommender: for each
+  media channel, it contains the optimal spend (where marginal CAC equals
+  the channel-specific revenue-per-conversion), expected incremental
+  revenue at that spend, and the dense response curve used to find it.
+
+  Attributes:
+    meridian: The fitted Meridian model.
+    analyzer: The analyzer bound to that model.
+    response_curves: Dense per-channel response curves (output of
+      `Analyzer.spend_response_curve_per_channel`). Dims:
+      `(channel, grid_index)`. Data vars: `spend`, `incremental_revenue`,
+      `marginal_revenue`.
+    optimal: Per-channel optimum. Dims: `(channel,)`. Data vars: `spend`,
+      `incremental_revenue`, `marginal_revenue`, `profit`,
+      `historical_spend`, `spend_multiplier`.
+    spend_multiplier_max: Upper bound used for the per-channel grid as a
+      multiple of historical spend.
+    n_grid_points: Number of grid points used per channel.
+  """
+
+  meridian: 'model.Meridian'
+  analyzer: 'analyzer_module.Analyzer'
+  response_curves: xr.Dataset
+  optimal: xr.Dataset
+  spend_multiplier_max: float
+  n_grid_points: int
+
+  def to_dataframe(self) -> pd.DataFrame:
+    """Returns a `pd.DataFrame` summary of the per-channel optima."""
+    return self.optimal.to_dataframe().reset_index()
+
+  def summary(self) -> pd.DataFrame:
+    """Returns a printable summary table of the per-channel optima."""
+    df = self.to_dataframe()
+    df = df.rename(
+        columns={
+            c.SPEND: 'optimal_spend',
+            'incremental_revenue': 'expected_incremental_revenue',
+            'marginal_revenue': 'mROI_at_optimum',
+        }
+    )
+    return df
+
+  def plot_response_curves(self) -> 'alt.Chart':
+    """Plots the per-channel response curves with the optimum marked.
+
+    Returns:
+      An Altair chart with one facet per media channel showing the
+      incremental revenue vs spend curve and the optimal spend point.
+    """
+    rc_df = (
+        self.response_curves[['spend', 'incremental_revenue']]
+        .to_dataframe()
+        .reset_index()
+    )
+    opt_df = self.optimal.to_dataframe().reset_index()[
+        [c.CHANNEL, c.SPEND, 'incremental_revenue']
+    ]
+    base = alt.Chart(rc_df).mark_line().encode(
+        x=alt.X('spend:Q', title='Spend'),
+        y=alt.Y('incremental_revenue:Q', title='Incremental revenue'),
+        color=alt.Color(f'{c.CHANNEL}:N'),
+    )
+    points = alt.Chart(opt_df).mark_point(filled=True, size=80).encode(
+        x='spend:Q',
+        y='incremental_revenue:Q',
+        color=alt.Color(f'{c.CHANNEL}:N'),
+        tooltip=[c.CHANNEL, 'spend', 'incremental_revenue'],
+    )
+    return (base + points).facet(column=f'{c.CHANNEL}:N')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2057,6 +2134,217 @@ class BudgetOptimizer:
       )
 
     return True
+
+  def optimize_marginal_cac_to_rpc(
+      self,
+      *,
+      spend_multiplier_max: float = 5.0,
+      n_grid_points: int = 10_000,
+      use_posterior: bool = True,
+      selected_geos: Sequence[str] | None = None,
+      start_date: tc.Date = None,
+      end_date: tc.Date = None,
+      batch_size: int = c.DEFAULT_BATCH_SIZE,
+  ) -> 'MarginalCacOptimizationResults':
+    """Per-channel optimal media spend such that marginal CAC <= rpc.
+
+    For each media channel m, finds the largest spend
+    `s_m^* in [0, spend_multiplier_max * historical_spend_m]` such that the
+    marginal revenue per dollar (mROI in revenue terms) is at least 1, i.e.
+    where marginal CAC = 1 / mROI is no greater than the channel-specific
+    revenue-per-conversion `rpc_m`. Channel revenue curves are concave under
+    Hill+Adstock, so a unique crossing exists; the crossing is found by
+    secant evaluation on a dense grid (`n_grid_points`) and linear
+    interpolation between adjacent grid points.
+
+    This recommender is **media-only** and **non-revenue-mode-only**:
+
+    * Hard-fails if the model has reach-and-frequency channels (RF
+      attribution requires a different optimization treatment).
+    * Hard-fails if `kpi_type='revenue'` (the per-channel rpc has no
+      meaningful interpretation).
+    * Soft-warns if `media_revenue_per_kpi` is unset, in which case the
+      recommender effectively reduces to the existing `target_mroi=1.0`
+      flexible-budget search but evaluated continuously instead of on a
+      coarse grid.
+
+    Args:
+      spend_multiplier_max: Upper bound of the per-channel spend grid as a
+        multiple of historical spend. Default is `5.0`.
+      n_grid_points: Number of grid points per channel. Default is `10_000`.
+      use_posterior: If `True`, uses the posterior; else the prior.
+      selected_geos: Optional subset of geos to include in the recommendation.
+      start_date: Optional start of the time window to include.
+      end_date: Optional end of the time window to include.
+      batch_size: Forwarded to `Analyzer.incremental_outcome`.
+
+    Returns:
+      `MarginalCacOptimizationResults` with the per-channel optimal spend,
+      expected incremental revenue at the optimum, profit, and the dense
+      response curves.
+    """
+    self._validate_model_fit(use_posterior)
+    input_data = self._meridian.input_data
+    model_context = self._meridian.model_context
+    if input_data.kpi_type != c.NON_REVENUE:
+      raise ValueError(
+          'optimize_marginal_cac_to_rpc requires `kpi_type=`'
+          f' `{c.NON_REVENUE}`; got `{input_data.kpi_type}`.'
+      )
+    if model_context.n_rf_channels > 0:
+      raise ValueError(
+          'optimize_marginal_cac_to_rpc is media-only and the model has'
+          f' {model_context.n_rf_channels} reach-and-frequency channels.'
+          ' Run a flexible-budget optimization separately for those channels.'
+      )
+    if input_data.revenue_per_kpi is None:
+      raise ValueError(
+          'optimize_marginal_cac_to_rpc requires a default `revenue_per_kpi`'
+          ' (geo, time) array as the fallback for unmapped channels.'
+      )
+    if input_data.media_revenue_per_kpi is None:
+      warnings.warn(
+          '`media_revenue_per_kpi` is not set on InputData; the recommender'
+          ' will use the default `revenue_per_kpi(geo, time)` mean for every'
+          ' media channel, equivalent to a flexible-budget optimization with'
+          ' `target_mroi=1.0`.',
+          UserWarning,
+      )
+    if model_context.n_media_channels == 0:
+      raise ValueError(
+          'optimize_marginal_cac_to_rpc requires at least one media channel.'
+      )
+
+    # Convert (start_date, end_date) -> selected_times list.
+    selected_times = _expand_selected_times(
+        start_date=start_date,
+        end_date=end_date,
+        new_data=None,
+        model_context=model_context,
+        return_flexible_str=True,
+    )
+    response_curves = self._analyzer.spend_response_curve_per_channel(
+        spend_multiplier_max=spend_multiplier_max,
+        n_grid_points=n_grid_points,
+        use_posterior=use_posterior,
+        selected_geos=selected_geos,
+        selected_times=selected_times,
+        batch_size=batch_size,
+    )
+    spend_grid = response_curves[c.SPEND].values  # (n_channels, n_grid)
+    revenue_grid = response_curves['incremental_revenue'].values
+    marginal_grid = response_curves['marginal_revenue'].values
+    media_channels = response_curves[c.CHANNEL].values.tolist()
+    historical_spend = np.array(
+        [response_curves.attrs['historical_spend'][c_] for c_ in media_channels]
+    )
+
+    n_channels = len(media_channels)
+    optimal_spend = np.zeros(n_channels, dtype=np.float64)
+    optimal_incremental_revenue = np.zeros(n_channels, dtype=np.float64)
+    optimal_marginal_revenue = np.zeros(n_channels, dtype=np.float64)
+    edge_warning_channels: list[str] = []
+
+    for m, channel_name in enumerate(media_channels):
+      sp = spend_grid[m]
+      rev = revenue_grid[m]
+      mr = marginal_grid[m]
+      # The first secant entry is duplicated, so we work with index >= 1.
+      mr_geq1 = mr[1:] >= 1.0
+      if not mr_geq1.any():
+        # Curve is already past saturation at zero spend (data quality
+        # issue) -> recommend zero.
+        optimal_spend[m] = 0.0
+        optimal_incremental_revenue[m] = 0.0
+        optimal_marginal_revenue[m] = float(mr[1]) if len(mr) > 1 else 0.0
+        warnings.warn(
+            f'Channel `{channel_name}`: marginal revenue is below 1 even at'
+            ' the smallest non-zero spend; recommending 0 spend. This'
+            ' usually indicates a data or modeling issue (overly weak prior'
+            ' or rpc).',
+            UserWarning,
+        )
+        continue
+      if mr_geq1.all():
+        # Crossing not found within the grid; recommend top of grid and
+        # warn about increasing `spend_multiplier_max`.
+        optimal_spend[m] = float(sp[-1])
+        optimal_incremental_revenue[m] = float(rev[-1])
+        optimal_marginal_revenue[m] = float(mr[-1])
+        edge_warning_channels.append(channel_name)
+        continue
+      # Find largest i (in the [1, n_grid-1] range) where mr[i] >= 1 and
+      # mr[i+1] < 1.
+      i_candidates = np.where((mr[1:-1] >= 1.0) & (mr[2:] < 1.0))[0]
+      if i_candidates.size == 0:
+        # Concavity guarantees this is unreachable barring numerical noise;
+        # fall back to the last index where mr >= 1.
+        i = int(np.argmax(np.flatnonzero(mr_geq1)))
+      else:
+        i = int(i_candidates[-1] + 1)  # offset for the [1:] slicing.
+      mr_i = float(mr[i])
+      mr_ip1 = float(mr[i + 1])
+      sp_i = float(sp[i])
+      sp_ip1 = float(sp[i + 1])
+      rev_i = float(rev[i])
+      rev_ip1 = float(rev[i + 1])
+      denom = mr_ip1 - mr_i
+      if denom == 0.0:
+        # Flat segment - recommend the right edge of the segment where
+        # mROI is still >= 1.
+        s_opt = sp_i
+        rev_opt = rev_i
+        mr_opt = mr_i
+      else:
+        frac = (1.0 - mr_i) / denom
+        # Clamp for numerical safety.
+        frac = float(np.clip(frac, 0.0, 1.0))
+        s_opt = sp_i + frac * (sp_ip1 - sp_i)
+        rev_opt = rev_i + frac * (rev_ip1 - rev_i)
+        mr_opt = 1.0
+      optimal_spend[m] = s_opt
+      optimal_incremental_revenue[m] = rev_opt
+      optimal_marginal_revenue[m] = mr_opt
+
+    if edge_warning_channels:
+      warnings.warn(
+          'For channel(s) '
+          f'{edge_warning_channels}, the optimal spend appears to be at or'
+          f' beyond the grid upper bound (spend_multiplier_max='
+          f'{spend_multiplier_max}). Re-run with a larger'
+          ' `spend_multiplier_max` to find the true optimum.',
+          UserWarning,
+      )
+
+    profit = optimal_incremental_revenue - optimal_spend
+    spend_multiplier = np.where(
+        historical_spend > 0,
+        optimal_spend / np.maximum(historical_spend, 1e-12),
+        0.0,
+    )
+
+    optimal = xr.Dataset(
+        data_vars={
+            c.SPEND: ([c.CHANNEL], optimal_spend),
+            'incremental_revenue': (
+                [c.CHANNEL],
+                optimal_incremental_revenue,
+            ),
+            'marginal_revenue': ([c.CHANNEL], optimal_marginal_revenue),
+            'profit': ([c.CHANNEL], profit),
+            'historical_spend': ([c.CHANNEL], historical_spend),
+            'spend_multiplier': ([c.CHANNEL], spend_multiplier),
+        },
+        coords={c.CHANNEL: media_channels},
+    )
+    return MarginalCacOptimizationResults(
+        meridian=self._meridian,
+        analyzer=self._analyzer,
+        response_curves=response_curves,
+        optimal=optimal,
+        spend_multiplier_max=spend_multiplier_max,
+        n_grid_points=n_grid_points,
+    )
 
   def create_optimization_grid(
       self,

@@ -23,6 +23,22 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
 
 ## [Unreleased]
 
+* Add optional channel-level `InputData.media_revenue_per_kpi` field
+  (`Mapping[str, float]` or `xr.DataArray`) for non-revenue KPI models. When
+  set, post-hoc KPI->revenue conversion in `Analyzer._inverse_outcome` uses
+  the channel-specific rpc for media channels that have one (other channels
+  fall back to the default `revenue_per_kpi(geo, time)`). Builders gain
+  `with_media_revenue_per_kpi(mapping)`. Model fitting is unchanged because
+  `revenue_per_kpi` is not part of the likelihood.
+* Add `Analyzer.spend_response_curve_per_channel(...)` helper that returns
+  dense per-channel `(spend, incremental_revenue, marginal_revenue)` curves.
+* Add `BudgetOptimizer.optimize_marginal_cac_to_rpc(...)` per-channel
+  recommender that finds the largest spend per media channel where marginal
+  CAC <= rpc (equivalently, mROI in revenue terms >= 1) via dense
+  saturation-curve scan + linear interpolation. Returns
+  `MarginalCacOptimizationResults`. Media-only and non-revenue-mode-only;
+  hard-fails on RF channels or revenue-mode KPI.
+
 ## [1.6.0] - 2026-04-29
 
 * Add MeridianEDA for EDA visualizations and two-pager generation.

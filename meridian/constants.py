@@ -60,6 +60,7 @@ NATIONAL_PREFIX = 'national_'
 # Input data variables.
 KPI = 'kpi'
 REVENUE_PER_KPI = 'revenue_per_kpi'
+MEDIA_REVENUE_PER_KPI = 'media_revenue_per_kpi'
 MEDIA = 'media'
 MEDIA_SPEND = 'media_spend'
 CONTROLS = 'controls'

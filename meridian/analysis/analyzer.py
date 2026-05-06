@@ -1870,7 +1870,62 @@ class Analyzer:
 
     if use_kpi:
       return kpi
-    return backend.einsum("gt,...gtm->...gtm", revenue_per_kpi, kpi)
+
+    # Per-channel rpc override: when `media_revenue_per_kpi` is set on
+    # InputData, broadcast the supplied `revenue_per_kpi(g,t)` baseline
+    # across the channel axis and substitute the channel-specific scalar
+    # rpc for media channels that have one. The canonical channel ordering
+    # is `media -> rf -> organic_media -> organic_rf -> non_media`, so when
+    # the kpi tensor has fewer channels than the full count (e.g. caller
+    # restricted `data_tensors`), we slice the leading channels of the
+    # override array to match.
+    if self.model_context.input_data.media_revenue_per_kpi is None:
+      return backend.einsum("gt,...gtm->...gtm", revenue_per_kpi, kpi)
+
+    n_media = self.model_context.n_media_channels
+    m = kpi.shape[-1]
+    media_slot_size = min(n_media, m)
+    if media_slot_size == 0:
+      return backend.einsum("gt,...gtm->...gtm", revenue_per_kpi, kpi)
+
+    mrpk_np = self.model_context.input_data.media_revenue_per_kpi.values[
+        :media_slot_size
+    ]
+    has_override_np = ~np.isnan(mrpk_np)
+    if not has_override_np.any():
+      return backend.einsum("gt,...gtm->...gtm", revenue_per_kpi, kpi)
+
+    n_geos = self.model_context.n_geos
+    n_times_kpi = revenue_per_kpi.shape[1]
+    rpc_gtm = backend.broadcast_to(
+        revenue_per_kpi[:, :, None],
+        (n_geos, n_times_kpi, m),
+    )
+    override_filled_np = np.where(has_override_np, mrpk_np, 0.0)
+    override_filled = backend.to_tensor(
+        override_filled_np, dtype=backend.float_dtype
+    )
+    has_override = backend.to_tensor(has_override_np, dtype=backend.bool_)
+    media_override_slot = backend.broadcast_to(
+        override_filled[None, None, :],
+        (n_geos, n_times_kpi, media_slot_size),
+    )
+    media_has_override = backend.broadcast_to(
+        has_override[None, None, :],
+        (n_geos, n_times_kpi, media_slot_size),
+    )
+    media_slot = backend.where(
+        media_has_override,
+        media_override_slot,
+        rpc_gtm[:, :, :media_slot_size],
+    )
+    if media_slot_size == m:
+      effective_rpc_gtm = media_slot
+    else:
+      effective_rpc_gtm = backend.concatenate(
+          [media_slot, rpc_gtm[:, :, media_slot_size:]], axis=-1
+      )
+    return backend.einsum("gtm,...gtm->...gtm", effective_rpc_gtm, kpi)
 
   @backend.function(
       jit_compile=True,
@@ -4502,6 +4557,190 @@ class Analyzer:
     }
     attrs = {constants.CONFIDENCE_LEVEL: confidence_level}
     return xr.Dataset(data_vars=xr_data_vars, coords=xr_coords, attrs=attrs)
+
+  def spend_response_curve_per_channel(
+      self,
+      *,
+      media_channels: Sequence[str] | None = None,
+      spend_multiplier_max: float = 5.0,
+      n_grid_points: int = 10_000,
+      use_posterior: bool = True,
+      selected_geos: Sequence[str] | None = None,
+      selected_times: Sequence[str] | None = None,
+      batch_size: int = constants.DEFAULT_BATCH_SIZE,
+  ) -> xr.Dataset:
+    """Returns dense per-channel revenue and marginal-revenue curves.
+
+    Evaluates each media channel's saturation curve on a fine grid of spend
+    levels in `[0, spend_multiplier_max * historical_spend_m]`. Channel
+    contributions are additive in the Meridian model, so we evaluate all
+    channels in a single batched forward pass per multiplier by uniformly
+    scaling all media spend; per-channel curves are read off the per-channel
+    incremental-outcome dimension. The returned `incremental_revenue` reflects
+    the per-channel `media_revenue_per_kpi` override when set on `InputData`
+    (channels without an override fall back to the default
+    `revenue_per_kpi(geo, time)`).
+
+    Args:
+      media_channels: Optional subset of media channel names to compute curves
+        for. Defaults to all media channels.
+      spend_multiplier_max: Upper end of the spend grid as a multiple of each
+        channel's historical spend (within `selected_geos` /
+        `selected_times`). Must be positive.
+      n_grid_points: Number of grid points per channel between 0 and
+        `spend_multiplier_max * historical_spend_m`. Must be at least 2.
+      use_posterior: If `True`, uses the posterior; otherwise the prior.
+      selected_geos: Optional subset of geos to include.
+      selected_times: Optional subset of dates to include.
+      batch_size: Forwarded to `Analyzer.incremental_outcome`.
+
+    Returns:
+      `xr.Dataset` with dims `(channel, grid_index)` and data variables:
+
+      * `spend(channel, grid_index)`: per-channel spend grid in
+        `[0, spend_multiplier_max * historical_spend_m]`.
+      * `incremental_revenue(channel, grid_index)`: posterior- (or prior-)
+        mean incremental revenue at the corresponding spend.
+      * `marginal_revenue(channel, grid_index)`: secant
+        `Δ revenue / Δ spend` between adjacent grid points (mROI in revenue
+        terms). The first index repeats the leftmost finite secant for shape
+        consistency.
+
+      Attributes: `spend_multiplier_max`, `n_grid_points`,
+      `historical_spend` (per channel).
+    """
+    if spend_multiplier_max <= 0:
+      raise ValueError(
+          "`spend_multiplier_max` must be positive; got"
+          f" {spend_multiplier_max}."
+      )
+    if n_grid_points < 2:
+      raise ValueError(
+          "`n_grid_points` must be at least 2; got"
+          f" {n_grid_points}."
+      )
+
+    all_media_channels = (
+        self.model_context.input_data.media_channel.values.tolist()
+        if self.model_context.input_data.media_channel is not None
+        else []
+    )
+    if not all_media_channels:
+      raise ValueError(
+          "`spend_response_curve_per_channel` requires media channels; the"
+          " model has none."
+      )
+    if media_channels is None:
+      media_channels = list(all_media_channels)
+    else:
+      missing = [c for c in media_channels if c not in all_media_channels]
+      if missing:
+        raise ValueError(
+            f"Unknown media channels {missing}; known media channels are"
+            f" {all_media_channels}."
+        )
+    channel_indices = [all_media_channels.index(c) for c in media_channels]
+
+    # Historical aggregated media spend per channel within the selected
+    # geo/time slice.
+    spend_da = self.model_context.input_data.allocated_media_spend
+    if spend_da is None:
+      raise ValueError(
+          "`spend_response_curve_per_channel` requires `media_spend` data."
+      )
+    if selected_geos is None and selected_times is None:
+      hist_spend_full = np.asarray(spend_da.sum(dim=("geo", "time")).values)
+    else:
+      sliced = spend_da
+      if selected_geos is not None:
+        sliced = sliced.sel(geo=selected_geos)
+      if selected_times is not None:
+        sliced = sliced.sel(time=selected_times)
+      hist_spend_full = np.asarray(sliced.sum(dim=("geo", "time")).values)
+    hist_spend = hist_spend_full[channel_indices]
+
+    grid = np.linspace(0.0, spend_multiplier_max, n_grid_points)
+    spend_grid = grid[None, :] * hist_spend[:, None]  # (n_channels, n_grid)
+
+    # Evaluate `incremental_outcome` once per multiplier (channel
+    # contributions are additive, so all channels can be evaluated together).
+    n_channels_total = len(all_media_channels)
+    incremental_revenue_full = np.zeros(
+        (n_channels_total, n_grid_points), dtype=np.float64
+    )
+    dim_kwargs = {
+        "selected_geos": selected_geos,
+        "selected_times": selected_times,
+        "aggregate_geos": True,
+    }
+    for i, multiplier in enumerate(grid):
+      if multiplier == 0.0:
+        continue
+      scaled = _scale_tensors_by_multiplier(
+          data=DataTensors(
+              media=self.model_context.media_tensors.media,
+          ),
+          multiplier=float(multiplier),
+          by_reach=True,
+      )
+      inc = self.incremental_outcome(
+          use_posterior=use_posterior,
+          new_data=scaled.filter_fields(constants.PAID_DATA),
+          inverse_transform_outcome=True,
+          batch_size=batch_size,
+          use_kpi=False,
+          include_non_paid_channels=False,
+          aggregate_times=True,
+          **dim_kwargs,
+      )
+      # Shape: (..., n_paid_channels). Take posterior mean over chains/draws.
+      inc_np = np.asarray(inc).reshape(-1, np.asarray(inc).shape[-1])
+      mean_inc = inc_np.mean(axis=0)
+      # Only the first `n_media_channels` slots are media (RF channels are
+      # excluded by the recommender's pre-flight checks).
+      incremental_revenue_full[:, i] = mean_inc[:n_channels_total]
+
+    incremental_revenue = incremental_revenue_full[channel_indices, :]
+
+    # Secant marginal revenue: ΔRev / ΔSpend between adjacent grid points.
+    spend_diff = np.diff(spend_grid, axis=1)
+    rev_diff = np.diff(incremental_revenue, axis=1)
+    marginal_revenue = np.zeros_like(incremental_revenue)
+    with np.errstate(divide="ignore", invalid="ignore"):
+      marginal_revenue[:, 1:] = np.where(
+          spend_diff > 0,
+          rev_diff / np.where(spend_diff == 0, 1.0, spend_diff),
+          0.0,
+      )
+    # Pad index 0 with the next-adjacent secant so the shape matches.
+    marginal_revenue[:, 0] = marginal_revenue[:, 1]
+
+    coords = {
+        constants.CHANNEL: list(media_channels),
+        "grid_index": np.arange(n_grid_points),
+    }
+    return xr.Dataset(
+        data_vars={
+            constants.SPEND: (
+                [constants.CHANNEL, "grid_index"],
+                spend_grid,
+            ),
+            "incremental_revenue": (
+                [constants.CHANNEL, "grid_index"],
+                incremental_revenue,
+            ),
+            "marginal_revenue": (
+                [constants.CHANNEL, "grid_index"],
+                marginal_revenue,
+            ),
+        },
+        coords=coords,
+        attrs={
+            "spend_multiplier_max": spend_multiplier_max,
+            "n_grid_points": n_grid_points,
+            "historical_spend": dict(zip(media_channels, hist_spend.tolist())),
+        },
+    )
 
   def adstock_decay(
       self, confidence_level: float = constants.DEFAULT_CONFIDENCE_LEVEL

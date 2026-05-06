@@ -1416,6 +1416,13 @@ class NdArrayInputDataBuilderTest(parameterized.TestCase):
         original_nd, np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
     )
 
+  def test_with_media_revenue_per_kpi_stores_mapping(self):
+    mapping = {'ch_0': 5.5, 'ch_1': 9.0}
+    builder = nd_array_input_data_builder.NDArrayInputDataBuilder(
+        kpi_type=constants.NON_REVENUE
+    ).with_media_revenue_per_kpi(mapping)
+    self.assertEqual(dict(builder.media_revenue_per_kpi), mapping)
+
 
 if __name__ == '__main__':
   absltest.main()

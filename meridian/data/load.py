@@ -318,6 +318,8 @@ class XrDatasetDataLoader(InputDataLoader):
       builder.organic_reach = self.dataset.organic_reach
     if constants.ORGANIC_FREQUENCY in self.dataset.data_vars.keys():
       builder.organic_frequency = self.dataset.organic_frequency
+    if constants.MEDIA_REVENUE_PER_KPI in self.dataset.data_vars.keys():
+      builder.media_revenue_per_kpi = self.dataset.media_revenue_per_kpi
     return builder.build()
 
 

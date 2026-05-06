@@ -14,6 +14,7 @@
 
 """An implementation of `InputDataBuilder` with DataFrame primitives."""
 
+from collections.abc import Mapping
 import logging
 import warnings
 
@@ -308,6 +309,26 @@ class DataFrameInputDataBuilder(input_data_builder.InputDataBuilder):
         .to_xarray()
     )
 
+    return self
+
+  def with_media_revenue_per_kpi(
+      self,
+      mapping: Mapping[str, float],
+  ) -> 'DataFrameInputDataBuilder':
+    """Sets the optional channel-level `media_revenue_per_kpi` override.
+
+    Only meaningful when `kpi_type='non_revenue'`. Channels missing from
+    `mapping` fall back to the default `revenue_per_kpi(geo, time)`. Keys
+    that do not match any media channel in the data are dropped with a
+    warning during `build()`.
+
+    Args:
+      mapping: Mapping of media channel name to revenue-per-conversion.
+
+    Returns:
+      The `DataFrameInputDataBuilder` with the added override.
+    """
+    self.media_revenue_per_kpi = mapping
     return self
 
   def with_media(

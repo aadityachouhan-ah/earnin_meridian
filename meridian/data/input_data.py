@@ -18,7 +18,7 @@ The `InputData` class is used to store all the input data to the model.
 """
 
 from collections import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 import functools
 import warnings
@@ -131,6 +131,18 @@ class InputData:
       done on `kpi`, model analysis and optimization are done on `KPI *
       revenue_per_kpi` (revenue), if this value is available. If `kpi`
       corresponds to revenue, then an array of ones is passed automatically.
+    media_revenue_per_kpi: An optional channel-level revenue-per-conversion
+      override. Only allowed when `kpi_type='non_revenue'`, and only applied
+      to media channels (not reach-and-frequency, organic, or non-media
+      treatments). May be passed as a `dict[str, float]` (constructor will
+      normalize to a 1D `xr.DataArray` indexed by `media_channel`) or directly
+      as such a `DataArray`. Channels missing from the mapping fall back to
+      the default `revenue_per_kpi(geo, time)`. Keys that do not match any
+      media channel in the data are dropped with a warning so a single
+      canonical mapping can be reused across models. Values must be finite and
+      positive. This affects only post-hoc KPI->revenue conversion in the
+      analysis layer; model fitting itself is unchanged because
+      `revenue_per_kpi` is not part of the likelihood.
     media: An optional DataArray of dimensions `(n_geos, n_media_times,
       n_media_channels)` containing non-negative media execution values.
       Typically these are impressions, but it can be any metric, such as cost or
@@ -287,11 +299,13 @@ class InputData:
   organic_reach: xr.DataArray | None = None
   organic_frequency: xr.DataArray | None = None
   non_media_treatments: xr.DataArray | None = None
+  media_revenue_per_kpi: xr.DataArray | Mapping[str, float] | None = None
 
   def __post_init__(self):
     self._convert_geos_to_strings()
     self._validate_kpi()
     self._validate_scenarios()
+    self._normalize_media_revenue_per_kpi()
     self._validate_names()
     self._validate_dimensions()
     self._validate_media_channels()
@@ -299,6 +313,7 @@ class InputData:
     self._validate_times()
     self._validate_geos()
     self._validate_no_negative_values()
+    self._validate_media_revenue_per_kpi()
 
   def _convert_geos_to_strings(self):
     """Converts geo coordinates to strings in all relevant DataArrays."""
@@ -306,6 +321,60 @@ class InputData:
       array = getattr(self, field.name)
       if isinstance(array, xr.DataArray) and constants.GEO in array.dims:
         array.coords[constants.GEO] = array.coords[constants.GEO].astype(str)
+
+  @functools.cached_property
+  def effective_media_revenue_per_kpi(self) -> xr.DataArray | None:
+    """Per-media-channel revenue-per-kpi, broadcast to `(geo, time, channel)`.
+
+    Returns `None` when the model has no media data. For each media channel:
+
+    * If the channel has an entry in `media_revenue_per_kpi`, that scalar is
+      broadcast across the geo and time dimensions.
+    * Otherwise, the channel slot uses the default `revenue_per_kpi(geo, time)`
+      array.
+
+    Used by the analysis layer to convert per-channel incremental KPI to
+    per-channel incremental revenue.
+    """
+    if self.media is None:
+      return None
+    if self.revenue_per_kpi is None:
+      return None
+    media_channels = self.media_channel.values.tolist()
+    n_media_channels = len(media_channels)
+
+    rpk_gt = self.revenue_per_kpi  # (geo, time)
+    expanded_default = rpk_gt.expand_dims(
+        {constants.MEDIA_CHANNEL: media_channels}, axis=-1
+    )
+
+    if self.media_revenue_per_kpi is None:
+      effective = expanded_default.copy()
+    else:
+      mrpk = self.media_revenue_per_kpi  # (media_channel,)
+      mrpk_values = mrpk.values
+      n_geos = len(rpk_gt.coords[constants.GEO])
+      n_times = len(rpk_gt.coords[constants.TIME])
+      override_gtm = np.broadcast_to(
+          mrpk_values[np.newaxis, np.newaxis, :],
+          (n_geos, n_times, n_media_channels),
+      )
+      effective_values = np.where(
+          np.isfinite(override_gtm),
+          override_gtm,
+          expanded_default.values,
+      )
+      effective = xr.DataArray(
+          effective_values,
+          dims=[constants.GEO, constants.TIME, constants.MEDIA_CHANNEL],
+          coords={
+              constants.GEO: rpk_gt.coords[constants.GEO],
+              constants.TIME: rpk_gt.coords[constants.TIME],
+              constants.MEDIA_CHANNEL: media_channels,
+          },
+          name="effective_media_revenue_per_kpi",
+      )
+    return effective
 
   # TODO: Combine with Analyzer._impute_and_aggregate_spend
   @functools.cached_property
@@ -531,6 +600,105 @@ class InputData:
             " https://developers.google.com/meridian/docs/advanced-modeling/unknown-revenue-kpi-custom#set-total-paid-media-contribution-prior",
             UserWarning,
         )
+
+  def _normalize_media_revenue_per_kpi(self):
+    """Normalizes `media_revenue_per_kpi` from `dict` -> `xr.DataArray`.
+
+    Accepts a `dict[str, float]` and converts it to a 1D `xr.DataArray`
+    indexed by `media_channel`. Keys that are not present in
+    `InputData.media_channel` are dropped with a warning. Missing media
+    channels are filled with `NaN` (the analysis layer falls back to the
+    default `revenue_per_kpi(geo, time)` for those channels).
+    """
+    if self.media_revenue_per_kpi is None:
+      return
+    if isinstance(self.media_revenue_per_kpi, xr.DataArray):
+      return
+    if not isinstance(self.media_revenue_per_kpi, abc.Mapping):
+      raise TypeError(
+          "`media_revenue_per_kpi` must be a Mapping[str, float] or"
+          " xr.DataArray; got"
+          f" {type(self.media_revenue_per_kpi).__name__}."
+      )
+    if self.media_channel is None:
+      raise ValueError(
+          "`media_revenue_per_kpi` was provided but `InputData` has no"
+          " `media` data."
+      )
+
+    media_channels = self.media_channel.values.tolist()
+    mapping = dict(self.media_revenue_per_kpi)
+    unknown_keys = [k for k in mapping if k not in media_channels]
+    if unknown_keys:
+      warnings.warn(
+          "Dropping `media_revenue_per_kpi` entries that do not match any"
+          f" media channel in the data: {sorted(unknown_keys)}. Known media"
+          f" channels: {media_channels}.",
+          UserWarning,
+      )
+      for k in unknown_keys:
+        mapping.pop(k)
+
+    values = np.full(len(media_channels), np.nan, dtype=np.float64)
+    for i, channel in enumerate(media_channels):
+      if channel in mapping:
+        values[i] = float(mapping[channel])
+
+    self.media_revenue_per_kpi = xr.DataArray(
+        values,
+        dims=[constants.MEDIA_CHANNEL],
+        coords={constants.MEDIA_CHANNEL: media_channels},
+        name=constants.MEDIA_REVENUE_PER_KPI,
+    )
+
+  def _validate_media_revenue_per_kpi(self):
+    """Validates a normalized `media_revenue_per_kpi` `xr.DataArray`."""
+    if self.media_revenue_per_kpi is None:
+      return
+
+    if self.kpi_type != constants.NON_REVENUE:
+      raise ValueError(
+          "`media_revenue_per_kpi` is only supported when"
+          f" `kpi_type='{constants.NON_REVENUE}'` (got"
+          f" `kpi_type='{self.kpi_type}'`)."
+      )
+    if self.revenue_per_kpi is None:
+      raise ValueError(
+          "`media_revenue_per_kpi` requires a default `revenue_per_kpi`"
+          " (geo, time) array as the fallback for media channels not in the"
+          " mapping and for organic / non-media KPI->revenue conversion."
+      )
+    if self.media_channel is None:
+      raise ValueError(
+          "`media_revenue_per_kpi` was provided but `InputData` has no"
+          " `media` data."
+      )
+
+    array = self.media_revenue_per_kpi
+    if list(array.dims) != [constants.MEDIA_CHANNEL]:
+      raise ValueError(
+          "`media_revenue_per_kpi` must have dimensions"
+          f" `[{constants.MEDIA_CHANNEL}]`; got {list(array.dims)}."
+      )
+    array_channels = array.coords[constants.MEDIA_CHANNEL].values.tolist()
+    media_channels = self.media_channel.values.tolist()
+    if array_channels != media_channels:
+      raise ValueError(
+          "`media_revenue_per_kpi` channel coordinates must match"
+          f" `media_channel`. Expected {media_channels}; got"
+          f" {array_channels}."
+      )
+    values = array.values
+    # NaN entries are sentinels meaning "fall back to default revenue_per_kpi";
+    # any other non-finite (inf / -inf) or non-positive entry is invalid.
+    invalid_mask = ~np.isnan(values) & (
+        ~np.isfinite(values) | (values <= 0)
+    )
+    if invalid_mask.any():
+      raise ValueError(
+          "`media_revenue_per_kpi` values must be positive and finite; got"
+          f" {dict(zip(array_channels, values.tolist()))}."
+      )
 
   def _validate_kpi(self):
     """Validates the KPI data."""
@@ -840,6 +1008,8 @@ class InputData:
       data.append(self.organic_frequency)
     if self.non_media_treatments is not None:
       data.append(self.non_media_treatments)
+    if self.media_revenue_per_kpi is not None:
+      data.append(self.media_revenue_per_kpi)
 
     return xr.combine_by_coords(data)
 

@@ -1672,6 +1672,184 @@ class InputDataTest(parameterized.TestCase):
     self.assertNotEmpty(data.scaled_centered_kpi)
 
 
+class MediaRevenuePerKpiTest(parameterized.TestCase):
+  """Tests for the optional `media_revenue_per_kpi` channel-level override."""
+
+  def _make_data(
+      self,
+      *,
+      media_revenue_per_kpi=None,
+      kpi_type=constants.NON_REVENUE,
+      with_revenue_per_kpi=True,
+  ) -> input_data.InputData:
+    data = test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=3,
+    )
+    kwargs = dict(
+        kpi=data.kpi,
+        kpi_type=kpi_type,
+        population=data.population,
+        controls=data.controls,
+        media=data.media,
+        media_spend=data.media_spend,
+    )
+    if with_revenue_per_kpi:
+      kwargs["revenue_per_kpi"] = data.revenue_per_kpi
+    if media_revenue_per_kpi is not None:
+      kwargs["media_revenue_per_kpi"] = media_revenue_per_kpi
+    return input_data.InputData(**kwargs)
+
+  def test_construct_with_dict_normalizes_to_dataarray(self):
+    data = self._make_data(
+        media_revenue_per_kpi={"ch_0": 12.5, "ch_2": 7.0}
+    )
+    self.assertIsInstance(data.media_revenue_per_kpi, xr.DataArray)
+    self.assertEqual(
+        list(data.media_revenue_per_kpi.dims), [constants.MEDIA_CHANNEL]
+    )
+    self.assertEqual(
+        data.media_revenue_per_kpi.coords[
+            constants.MEDIA_CHANNEL
+        ].values.tolist(),
+        ["ch_0", "ch_1", "ch_2"],
+    )
+    np.testing.assert_array_equal(
+        data.media_revenue_per_kpi.values,
+        np.array([12.5, np.nan, 7.0]),
+    )
+
+  def test_construct_with_dataarray_passthrough(self):
+    arr = xr.DataArray(
+        np.array([1.0, 2.0, 3.0]),
+        dims=[constants.MEDIA_CHANNEL],
+        coords={constants.MEDIA_CHANNEL: ["ch_0", "ch_1", "ch_2"]},
+        name=constants.MEDIA_REVENUE_PER_KPI,
+    )
+    data = self._make_data(media_revenue_per_kpi=arr)
+    np.testing.assert_array_equal(
+        data.media_revenue_per_kpi.values, np.array([1.0, 2.0, 3.0])
+    )
+
+  def test_unknown_keys_are_dropped_with_warning(self):
+    with self.assertWarnsRegex(
+        UserWarning,
+        expected_regex="Dropping `media_revenue_per_kpi` entries",
+    ):
+      data = self._make_data(
+          media_revenue_per_kpi={"ch_0": 1.0, "not_a_real_channel": 99.0}
+      )
+    self.assertEqual(
+        data.media_revenue_per_kpi.coords[
+            constants.MEDIA_CHANNEL
+        ].values.tolist(),
+        ["ch_0", "ch_1", "ch_2"],
+    )
+    np.testing.assert_array_equal(
+        data.media_revenue_per_kpi.values,
+        np.array([1.0, np.nan, np.nan]),
+    )
+
+  def test_revenue_mode_raises(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="`media_revenue_per_kpi` is only supported when",
+    ):
+      self._make_data(
+          media_revenue_per_kpi={"ch_0": 1.0},
+          kpi_type=constants.REVENUE,
+      )
+
+  def test_missing_revenue_per_kpi_raises(self):
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="requires a default `revenue_per_kpi`",
+    ):
+      self._make_data(
+          media_revenue_per_kpi={"ch_0": 1.0},
+          with_revenue_per_kpi=False,
+      )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="zero", value=0.0),
+      dict(testcase_name="negative", value=-3.5),
+      dict(testcase_name="inf", value=float("inf")),
+  )
+  def test_invalid_value_raises(self, value: float):
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="`media_revenue_per_kpi` values must be positive",
+    ):
+      self._make_data(media_revenue_per_kpi={"ch_0": value})
+
+  def test_non_mapping_input_raises(self):
+    with self.assertRaisesRegex(
+        TypeError,
+        expected_regex="must be a Mapping",
+    ):
+      self._make_data(media_revenue_per_kpi=[1.0, 2.0, 3.0])
+
+  def test_provided_without_media_raises(self):
+    """If there is no media data at all, the override has nothing to attach."""
+    data = test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+        n_media_channels=3
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        expected_regex="has no `media` data",
+    ):
+      input_data.InputData(
+          kpi=data.kpi,
+          kpi_type=constants.NON_REVENUE,
+          population=data.population,
+          controls=data.controls,
+          revenue_per_kpi=data.revenue_per_kpi,
+          reach=data.reach if data.reach is not None else None,
+          frequency=(
+              data.frequency if data.frequency is not None else None
+          ),
+          rf_spend=data.rf_spend if data.rf_spend is not None else None,
+          media_revenue_per_kpi={"ch_0": 1.0},
+      )
+
+  def test_effective_media_revenue_per_kpi_falls_back(self):
+    data = self._make_data(
+        media_revenue_per_kpi={"ch_0": 12.5, "ch_2": 7.0}
+    )
+    effective = data.effective_media_revenue_per_kpi
+    self.assertIsNotNone(effective)
+    self.assertEqual(
+        list(effective.dims),
+        [constants.GEO, constants.TIME, constants.MEDIA_CHANNEL],
+    )
+    # Channel 0: scalar override broadcast across geo/time.
+    np.testing.assert_array_equal(
+        effective.sel(media_channel="ch_0").values,
+        np.full_like(data.revenue_per_kpi.values, 12.5),
+    )
+    # Channel 1: missing override -> default revenue_per_kpi (geo, time).
+    np.testing.assert_array_equal(
+        effective.sel(media_channel="ch_1").values,
+        data.revenue_per_kpi.values,
+    )
+    # Channel 2: scalar override broadcast across geo/time.
+    np.testing.assert_array_equal(
+        effective.sel(media_channel="ch_2").values,
+        np.full_like(data.revenue_per_kpi.values, 7.0),
+    )
+
+  def test_effective_media_revenue_per_kpi_no_override(self):
+    data = self._make_data()
+    effective = data.effective_media_revenue_per_kpi
+    self.assertIsNotNone(effective)
+    # Without an override, all channels equal default revenue_per_kpi.
+    expected = (
+        data.revenue_per_kpi.expand_dims(
+            {constants.MEDIA_CHANNEL: ["ch_0", "ch_1", "ch_2"]}, axis=-1
+        ).values
+    )
+    np.testing.assert_array_equal(effective.values, expected)
+
+
 class NonpaidInputDataTest(parameterized.TestCase):
   """Tests for non-paid InputData."""
 

@@ -2341,6 +2341,13 @@ class DataFrameInputDataBuilderTest(parameterized.TestCase):
     )
     self.assertIsNotNone(builder.non_media_treatments)
 
+  def test_with_media_revenue_per_kpi_stores_mapping(self):
+    mapping = {"channel_a": 7.5, "channel_b": 12.0}
+    builder = data_frame_input_data_builder.DataFrameInputDataBuilder(
+        kpi_type=constants.NON_REVENUE
+    ).with_media_revenue_per_kpi(mapping)
+    self.assertEqual(dict(builder.media_revenue_per_kpi), mapping)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -5478,5 +5478,219 @@ class AnalyzerCustomPriorTest(backend_test_utils.MeridianTestCase):
     check_treatment_parameters(mmm, use_posterior=True)
 
 
+class AnalyzerMediaRevenuePerKpiTest(backend_test_utils.MeridianTestCase):
+  """Tests that `Analyzer._inverse_outcome` honors per-channel rpc."""
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls.input_data_default = (
+        data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+            n_geos=_N_GEOS,
+            n_times=_N_TIMES,
+            n_media_times=_N_MEDIA_TIMES,
+            n_controls=_N_CONTROLS,
+            n_media_channels=_N_MEDIA_CHANNELS,
+            seed=0,
+        )
+    )
+    cls.input_data_override = cls.input_data_default.copy()
+    cls.media_rpc_override = {"ch_0": 12.5, "ch_2": 7.0}
+    cls.input_data_override.media_revenue_per_kpi = cls.media_rpc_override
+    cls.input_data_override._normalize_media_revenue_per_kpi()
+    cls.input_data_override._validate_media_revenue_per_kpi()
+
+    model_spec = spec.ModelSpec(max_lag=15)
+    cls.meridian_default = model.Meridian(
+        input_data=cls.input_data_default, model_spec=model_spec
+    )
+    cls.meridian_override = model.Meridian(
+        input_data=cls.input_data_override, model_spec=model_spec
+    )
+
+    cls.inference_data = _build_inference_data(
+        _TEST_SAMPLE_PRIOR_MEDIA_ONLY_PATH,
+        _TEST_SAMPLE_POSTERIOR_MEDIA_ONLY_PATH,
+    )
+    cls.enter_context(
+        mock.patch.object(
+            model.Meridian,
+            "inference_data",
+            new=property(lambda unused_self: cls.inference_data),
+        )
+    )
+
+    cls.analyzer_default = analyzer.Analyzer(
+        model_context=cls.meridian_default.model_context,
+        inference_data=cls.inference_data,
+    )
+    cls.analyzer_override = analyzer.Analyzer(
+        model_context=cls.meridian_override.model_context,
+        inference_data=cls.inference_data,
+    )
+
+  def test_default_path_unchanged_when_no_override(self):
+    # No `media_revenue_per_kpi` set: incremental_outcome must match the
+    # legacy `revenue_per_kpi(geo,time)` broadcast behavior.
+    incremental_kpi = self.analyzer_default.incremental_outcome(
+        use_kpi=True, use_posterior=False
+    )
+    incremental_revenue = self.analyzer_default.incremental_outcome(
+        use_kpi=False, use_posterior=False
+    )
+    rpk = backend.to_tensor(
+        self.input_data_default.revenue_per_kpi.values,
+        dtype=backend.float_dtype,
+    )
+    expected = (
+        backend.einsum("gt,...->...", rpk, backend.ones(()))
+    )  # placeholder
+    # Aggregated incremental_outcome reduces over geo & time; by default we
+    # compare ratio of revenue to kpi which is `mean(rpk)` since rpk is
+    # constant across geo/time in the sample data.
+    ratio = (
+        np.asarray(incremental_revenue) / np.asarray(incremental_kpi)
+    )
+    np.testing.assert_allclose(
+        ratio, float(np.mean(rpk)), rtol=1e-4, atol=1e-4
+    )
+    del expected
+
+  def test_override_path_scales_per_media_channel(self):
+    # With `media_revenue_per_kpi`, incremental revenue per media channel
+    # must equal incremental KPI scaled by the channel-specific rpc when
+    # provided, else by the default rpc.
+    incremental_kpi = np.asarray(
+        self.analyzer_override.incremental_outcome(
+            use_kpi=True, use_posterior=False
+        )
+    )
+    incremental_revenue = np.asarray(
+        self.analyzer_override.incremental_outcome(
+            use_kpi=False, use_posterior=False
+        )
+    )
+    # Shape: (chains, draws, n_media_channels) for media-only model.
+    self.assertEqual(incremental_kpi.shape[-1], _N_MEDIA_CHANNELS)
+
+    default_rpc = float(
+        np.mean(self.input_data_override.revenue_per_kpi.values)
+    )
+    expected_per_channel = np.array(
+        [
+            self.media_rpc_override.get("ch_0", default_rpc),
+            self.media_rpc_override.get("ch_1", default_rpc),
+            self.media_rpc_override.get("ch_2", default_rpc),
+        ]
+    )
+
+    # The conversion is multiplicative per (g, t), and incremental_outcome
+    # by default sums over geo and time. With constant rpk and constant
+    # per-channel scalar overrides, the channel-specific ratio collapses
+    # to the per-channel rpc.
+    ratio = incremental_revenue / incremental_kpi
+    for m in range(_N_MEDIA_CHANNELS):
+      np.testing.assert_allclose(
+          ratio[..., m], expected_per_channel[m], rtol=1e-4, atol=1e-4
+      )
+
+  def test_roi_uses_per_channel_rpc(self):
+    # Per-channel ROI numerator goes through `_inverse_outcome`, so the
+    # override propagates to ROI / mROI / response curves automatically.
+    roi_default = np.asarray(
+        self.analyzer_default.roi(use_posterior=False)
+    )
+    roi_override = np.asarray(
+        self.analyzer_override.roi(use_posterior=False)
+    )
+    default_rpc = float(
+        np.mean(self.input_data_override.revenue_per_kpi.values)
+    )
+    expected_scale = np.array([
+        self.media_rpc_override["ch_0"] / default_rpc,
+        1.0,  # ch_1 has no override -> ratio is 1.
+        self.media_rpc_override["ch_2"] / default_rpc,
+    ])
+    ratio = roi_override / roi_default
+    for m in range(_N_MEDIA_CHANNELS):
+      np.testing.assert_allclose(
+          ratio[..., m], expected_scale[m], rtol=1e-3, atol=1e-3
+      )
+
+  def test_response_curves_use_per_channel_rpc(self):
+    # `response_curves` reports incremental outcome per channel for a grid
+    # of spend multipliers; the per-channel rpc must scale each channel's
+    # curve. Output dims: (spend_multiplier, channel, metric).
+    rc_default = self.analyzer_default.response_curves(
+        use_posterior=False, spend_multipliers=[0.5, 1.0, 1.5]
+    )
+    rc_override = self.analyzer_override.response_curves(
+        use_posterior=False, spend_multipliers=[0.5, 1.0, 1.5]
+    )
+    default_rpc = float(
+        np.mean(self.input_data_override.revenue_per_kpi.values)
+    )
+    incremental_default = rc_default[constants.INCREMENTAL_OUTCOME].values
+    incremental_override = rc_override[
+        constants.INCREMENTAL_OUTCOME
+    ].values
+    expected_scale = np.array([
+        self.media_rpc_override["ch_0"] / default_rpc,
+        1.0,
+        self.media_rpc_override["ch_2"] / default_rpc,
+    ])
+    # Skip the first spend_multiplier index where the curve passes through
+    # zero (ratios there are ill-defined).
+    for m in range(_N_MEDIA_CHANNELS):
+      ratio_m = (
+          incremental_override[1:, m, :] / incremental_default[1:, m, :]
+      )
+      np.testing.assert_allclose(
+          ratio_m, expected_scale[m], rtol=1e-3, atol=1e-3
+      )
+
+  def test_expected_outcome_keeps_default_rpc_documented_asymmetry(self):
+    # Total expected outcome multiplies the modeled outcome (no channel
+    # axis) by the default `revenue_per_kpi(g, t)` only. This asymmetry is
+    # intentional and documented: per-channel ROI uses the override; total
+    # expected revenue uses the default rpc.
+    eo_default = np.asarray(
+        self.analyzer_default.expected_outcome(use_posterior=False)
+    )
+    eo_override = np.asarray(
+        self.analyzer_override.expected_outcome(use_posterior=False)
+    )
+    np.testing.assert_allclose(eo_default, eo_override, rtol=1e-6, atol=0)
+
+  def test_explicit_revenue_per_kpi_only_affects_unoverridden_channels(self):
+    # When the caller passes a custom `revenue_per_kpi` baseline through
+    # `new_data`, the per-channel override still applies on top of it: it
+    # only changes the per-(g,t) baseline used for media channels that
+    # don't have a per-channel rpc and for non-media slots.
+    custom_rpk = backend.ones((_N_GEOS, _N_TIMES)) * 3.0
+    out = np.asarray(
+        self.analyzer_override.incremental_outcome(
+            use_posterior=False,
+            new_data=analyzer.DataTensors(revenue_per_kpi=custom_rpk),
+        )
+    )
+    out_kpi = np.asarray(
+        self.analyzer_override.incremental_outcome(
+            use_posterior=False, use_kpi=True
+        )
+    )
+    ratio = out / out_kpi
+    expected_per_channel = np.array([
+        self.media_rpc_override.get("ch_0", 3.0),
+        # ch_1 falls back to the supplied baseline (3.0).
+        3.0,
+        self.media_rpc_override.get("ch_2", 3.0),
+    ])
+    for m in range(_N_MEDIA_CHANNELS):
+      np.testing.assert_allclose(
+          ratio[..., m], expected_per_channel[m], rtol=1e-4, atol=1e-4
+      )
+
+
 if __name__ == "__main__":
   absltest.main()

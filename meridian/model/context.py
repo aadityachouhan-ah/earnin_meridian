@@ -418,6 +418,85 @@ class ModelContext:
     )
 
   @functools.cached_property
+  def media_revenue_per_kpi_per_channel(self) -> backend.Tensor | None:
+    """Per-media-channel rpc as a 1D tensor (NaN where not provided)."""
+    if self._input_data.media_revenue_per_kpi is None:
+      return None
+    return backend.to_tensor(
+        self._input_data.media_revenue_per_kpi.values,
+        dtype=backend.float_dtype,
+    )
+
+  @functools.cached_property
+  def effective_revenue_per_kpi_gtm(self) -> backend.Tensor | None:
+    """Returns effective per-channel revenue-per-kpi `(geo, time, m)` tensor.
+
+    The `m` axis covers all paid + organic + non-media channels in the
+    canonical Meridian order: `media -> rf -> organic_media -> organic_rf
+    -> non_media`. Each media slot uses its scalar override broadcast over
+    `(geo, time)` when one is provided; all other slots (and missing media
+    channels) use the default `revenue_per_kpi(geo, time)`.
+
+    Returns `None` when `revenue_per_kpi` is unset (e.g. revenue-mode
+    models). The analyzer falls back to its existing default-rpc behavior in
+    that case.
+    """
+    if self._input_data.revenue_per_kpi is None:
+      return None
+    rpk_gt = backend.to_tensor(
+        self._input_data.revenue_per_kpi, dtype=backend.float_dtype
+    )
+    n_total_channels = (
+        self.n_media_channels
+        + self.n_rf_channels
+        + self.n_organic_media_channels
+        + self.n_organic_rf_channels
+        + self.n_non_media_channels
+    )
+    if n_total_channels == 0:
+      return rpk_gt
+    rpk_gtm = backend.broadcast_to(
+        rpk_gt[:, :, None],
+        (self.n_geos, self.n_times, n_total_channels),
+    )
+    if (
+        self._input_data.media_revenue_per_kpi is None
+        or self.n_media_channels == 0
+    ):
+      return rpk_gtm
+
+    # NaN entries in `media_revenue_per_kpi` are sentinels for "fall back to
+    # default revenue_per_kpi"; non-NaN entries are guaranteed positive +
+    # finite by the InputData validation. So `~is_nan` is the override mask.
+    mrpk_values = np.where(
+        np.isnan(self._input_data.media_revenue_per_kpi.values),
+        0.0,
+        self._input_data.media_revenue_per_kpi.values,
+    )
+    mrpk_tensor = backend.to_tensor(mrpk_values, dtype=backend.float_dtype)
+    has_override_1d = backend.to_tensor(
+        ~np.isnan(self._input_data.media_revenue_per_kpi.values),
+        dtype=backend.bool_,
+    )
+    media_override_gtm = backend.broadcast_to(
+        mrpk_tensor[None, None, :],
+        (self.n_geos, self.n_times, self.n_media_channels),
+    )
+    has_override = backend.broadcast_to(
+        has_override_1d[None, None, :],
+        (self.n_geos, self.n_times, self.n_media_channels),
+    )
+    media_slot = backend.where(
+        has_override,
+        media_override_gtm,
+        rpk_gtm[:, :, : self.n_media_channels],
+    )
+    if n_total_channels == self.n_media_channels:
+      return media_slot
+    other_slot = rpk_gtm[:, :, self.n_media_channels :]
+    return backend.concatenate([media_slot, other_slot], axis=-1)
+
+  @functools.cached_property
   def controls(self) -> backend.Tensor | None:
     if self._input_data.controls is None:
       return None

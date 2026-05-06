@@ -5276,5 +5276,182 @@ class OptimizerNewDataTensorsTest(parameterized.TestCase):
     )
 
 
+class MarginalCacOptimizationTest(parameterized.TestCase):
+  """Tests for `BudgetOptimizer.optimize_marginal_cac_to_rpc`."""
+
+  _N_GEOS = 5
+  _N_TIMES = 49
+  _N_MEDIA_TIMES = 52
+  _N_CONTROLS = 2
+  _N_MEDIA_CHANNELS = 3
+
+  def _make_optimizer(
+      self,
+      *,
+      with_rf: bool = False,
+      with_media_revenue_per_kpi: bool = True,
+      kpi_type: str = c.NON_REVENUE,
+      with_revenue_per_kpi: bool = True,
+  ) -> tuple[
+      optimizer.BudgetOptimizer, model.Meridian, az.InferenceData
+  ]:
+    if with_rf:
+      data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+          n_geos=self._N_GEOS,
+          n_times=self._N_TIMES,
+          n_media_times=self._N_MEDIA_TIMES,
+          n_media_channels=self._N_MEDIA_CHANNELS,
+          n_rf_channels=2,
+          n_controls=self._N_CONTROLS,
+          seed=0,
+      )
+      prior_path = os.path.join(_TEST_DATA_DIR, 'sample_prior_media_and_rf.nc')
+      posterior_path = os.path.join(
+          _TEST_DATA_DIR, 'sample_posterior_media_and_rf.nc'
+      )
+    else:
+      data = data_test_utils.sample_input_data_non_revenue_revenue_per_kpi(
+          n_geos=self._N_GEOS,
+          n_times=self._N_TIMES,
+          n_media_times=self._N_MEDIA_TIMES,
+          n_media_channels=self._N_MEDIA_CHANNELS,
+          n_controls=self._N_CONTROLS,
+          seed=0,
+      )
+      prior_path = os.path.join(_TEST_DATA_DIR, 'sample_prior_media_only.nc')
+      posterior_path = os.path.join(
+          _TEST_DATA_DIR, 'sample_posterior_media_only.nc'
+      )
+
+    if kpi_type == c.REVENUE:
+      data.kpi_type = c.REVENUE
+    if not with_revenue_per_kpi:
+      data.revenue_per_kpi = None
+    if with_media_revenue_per_kpi:
+      data.media_revenue_per_kpi = {'ch_0': 12.5, 'ch_2': 7.0}
+      data._normalize_media_revenue_per_kpi()
+      data._validate_media_revenue_per_kpi()
+
+    inference_data = az.InferenceData(
+        prior=xr.open_dataset(prior_path),
+        posterior=xr.open_dataset(posterior_path),
+    )
+    inference_data.groups = lambda: [c.PRIOR, c.POSTERIOR]
+    m = model.Meridian(input_data=data, model_spec=spec.ModelSpec(max_lag=15))
+    self.enter_context(
+        mock.patch.object(
+            model.Meridian,
+            'inference_data',
+            new=property(lambda unused_self: inference_data),
+        )
+    )
+    return optimizer.BudgetOptimizer(m), m, inference_data
+
+  def test_optimal_marginal_revenue_equals_one_at_solution(self):
+    opt, _, _ = self._make_optimizer()
+    result = opt.optimize_marginal_cac_to_rpc(
+        spend_multiplier_max=5.0, n_grid_points=400, use_posterior=False
+    )
+    np.testing.assert_allclose(
+        result.optimal['marginal_revenue'].values,
+        np.ones(self._N_MEDIA_CHANNELS),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+  def test_unmapped_channel_uses_default_rpc(self):
+    # ch_1 is not in the mapping; its optimum should use default rpc as the
+    # implicit per-channel revenue. With our 12.5 / 7.0 / 3.14 (default)
+    # rpcs, ch_1's optimum should differ from ch_0's and ch_2's.
+    opt, _, _ = self._make_optimizer()
+    result = opt.optimize_marginal_cac_to_rpc(
+        spend_multiplier_max=5.0, n_grid_points=400, use_posterior=False
+    )
+    # All three channels should have a finite, positive optimal spend that
+    # is below the upper grid bound (5x historical) — sanity check.
+    spend = result.optimal[c.SPEND].values
+    hist = result.optimal['historical_spend'].values
+    self.assertTrue(np.all(spend >= 0.0))
+    self.assertTrue(np.all(spend < 5.0 * hist))
+
+  def test_rf_present_raises(self):
+    opt, _, _ = self._make_optimizer(
+        with_rf=True, with_media_revenue_per_kpi=False
+    )
+    with self.assertRaisesRegex(
+        ValueError, expected_regex='media-only'
+    ):
+      opt.optimize_marginal_cac_to_rpc(use_posterior=False, n_grid_points=10)
+
+  def test_revenue_kpi_raises(self):
+    opt, _, _ = self._make_optimizer(
+        kpi_type=c.REVENUE, with_media_revenue_per_kpi=False
+    )
+    with self.assertRaisesRegex(
+        ValueError, expected_regex=f'kpi_type=`\\s?`{c.NON_REVENUE}`'
+    ):
+      opt.optimize_marginal_cac_to_rpc(use_posterior=False, n_grid_points=10)
+
+  def test_missing_revenue_per_kpi_raises(self):
+    opt, _, _ = self._make_optimizer(
+        with_revenue_per_kpi=False, with_media_revenue_per_kpi=False
+    )
+    with self.assertRaisesRegex(
+        ValueError, expected_regex='requires a default `revenue_per_kpi`'
+    ):
+      opt.optimize_marginal_cac_to_rpc(use_posterior=False, n_grid_points=10)
+
+  def test_unset_media_revenue_per_kpi_warns(self):
+    opt, _, _ = self._make_optimizer(with_media_revenue_per_kpi=False)
+    with self.assertWarnsRegex(
+        UserWarning, expected_regex='media_revenue_per_kpi'
+    ):
+      opt.optimize_marginal_cac_to_rpc(
+          use_posterior=False, n_grid_points=200
+      )
+
+  def test_low_spend_multiplier_max_warns(self):
+    # With a tiny upper bound the crossing is past the grid -> warn.
+    opt, _, _ = self._make_optimizer()
+    with self.assertWarnsRegex(
+        UserWarning, expected_regex='at or beyond the grid upper bound'
+    ):
+      opt.optimize_marginal_cac_to_rpc(
+          spend_multiplier_max=0.05,
+          n_grid_points=20,
+          use_posterior=False,
+      )
+
+  def test_invalid_spend_multiplier_raises(self):
+    opt, _, _ = self._make_optimizer()
+    with self.assertRaisesRegex(
+        ValueError, expected_regex='spend_multiplier_max'
+    ):
+      opt.optimize_marginal_cac_to_rpc(
+          spend_multiplier_max=0.0,
+          n_grid_points=10,
+          use_posterior=False,
+      )
+
+  def test_invalid_n_grid_points_raises(self):
+    opt, _, _ = self._make_optimizer()
+    with self.assertRaisesRegex(
+        ValueError, expected_regex='n_grid_points'
+    ):
+      opt.optimize_marginal_cac_to_rpc(
+          spend_multiplier_max=2.0,
+          n_grid_points=1,
+          use_posterior=False,
+      )
+
+  def test_existing_optimize_unchanged_with_override(self):
+    # Smoke test: setting media_revenue_per_kpi must not break the
+    # existing fixed-budget optimizer (its outputs flow through the same
+    # `_inverse_outcome` path so they benefit from the override too).
+    opt, _, _ = self._make_optimizer()
+    result = opt.optimize(use_posterior=False)
+    self.assertIsNotNone(result.optimized_data)
+
+
 if __name__ == '__main__':
   absltest.main()

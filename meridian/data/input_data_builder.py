@@ -20,7 +20,7 @@ validation logic and an overall final validation logic before a valid
 """
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import warnings
 from meridian import constants
 from meridian.data import input_data
@@ -72,6 +72,9 @@ class InputDataBuilder(abc.ABC):
     self._organic_reach: xr.DataArray = None
     self._organic_frequency: xr.DataArray = None
     self._non_media_treatments: xr.DataArray = None
+    self._media_revenue_per_kpi: (
+        xr.DataArray | Mapping[str, float] | None
+    ) = None
 
   @property
   def time_coords(self) -> Sequence[str]:
@@ -264,6 +267,35 @@ class InputDataBuilder(abc.ABC):
     self.time_coords = self.revenue_per_kpi.coords[
         constants.TIME
     ].values.tolist()
+
+  @property
+  def media_revenue_per_kpi(
+      self,
+  ) -> xr.DataArray | Mapping[str, float] | None:
+    return self._media_revenue_per_kpi
+
+  @media_revenue_per_kpi.setter
+  def media_revenue_per_kpi(
+      self,
+      media_revenue_per_kpi: xr.DataArray | Mapping[str, float],
+  ):
+    """Sets the optional channel-level `media_revenue_per_kpi` override.
+
+    Accepts a `dict[str, float]` (channel-name -> rpc) or a 1D
+    `xr.DataArray` indexed by `media_channel`. The value is held as-is and
+    handed off to `InputData(...)` in `build()`, which normalizes the dict
+    to an `xr.DataArray`, validates entries, and warns about unknown keys.
+
+    Only meaningful in `non_revenue` `kpi_type`. See
+    `InputData.media_revenue_per_kpi` for the full semantics.
+
+    Args:
+      media_revenue_per_kpi: Per-media-channel revenue-per-conversion override.
+    """
+    self._validate_set(
+        'Media Revenue per KPI', self._media_revenue_per_kpi
+    )
+    self._media_revenue_per_kpi = media_revenue_per_kpi
 
   @property
   def media(self) -> xr.DataArray:
@@ -640,6 +672,7 @@ class InputDataBuilder(abc.ABC):
         organic_media=_get_sorted(self.organic_media, True),
         organic_reach=_get_sorted(self.organic_reach, True),
         organic_frequency=_get_sorted(self.organic_frequency, True),
+        media_revenue_per_kpi=self.media_revenue_per_kpi,
     )
 
   def _normalize_coords(
