@@ -14,6 +14,8 @@ The customizations live in:
 
 EarnIn's MMM pipeline (`ml-pipelines/marketing/MMM/`, see its `CLAUDE.md`) consumes this via a manually built-and-uploaded wheel on Databricks — **not** an editable/local install. Changes here have zero runtime effect on that pipeline until a wheel is rebuilt and re-uploaded. See `ml-pipelines/marketing/MMM/CLAUDE.md` for the actual build/upload/version-bump workflow before assuming a change is "live" anywhere.
 
+Applied experiments, model-insights notebooks, and dashboards that load trained models via mlflow and `import meridian.analysis.*` directly live in `mmm_experiments` — see its `CLAUDE.md` (`~/Documents/work/EarnIn/Github/mmm_experiments/CLAUDE.md`).
+
 ## Local docs vault (Meridian's public methodology docs)
 
 There's a local Obsidian vault mirroring `developers.google.com/meridian/docs` at `~/Documents/Meridian_docs/Meridian-Vault/` — 74 markdown files, git-tracked, refreshed monthly (`~/Documents/Meridian_docs/run.sh`; check `git log` in the vault if something seems stale).
