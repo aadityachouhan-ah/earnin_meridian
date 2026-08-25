@@ -367,6 +367,59 @@ class CalculateBetaXTest(
         rtol=1e-4,
     )
 
+  @parameterized.named_parameters(
+      dict(testcase_name="overflow_side", shift=120.0),
+      dict(testcase_name="underflow_side", shift=-120.0),
+  )
+  def test_calculate_beta_x_log_normal_is_stable_past_float32_exp_limit(
+      self, shift: float
+  ):
+    """A constant eta_x * beta_gx_dev must shift beta_x by exactly -shift.
+
+    |shift| here is past float32's exp() limit of ~88, which is where summing
+    exp() over geos before the log used to give inf (positive shift) or zero
+    (negative shift), and hence a non-finite beta_x.
+    """
+    model_context = context.ModelContext(
+        input_data=self.small_data,
+        model_spec=spec.ModelSpec(
+            media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL
+        ),
+    )
+    eqn = equations.ModelEquations(model_context=model_context)
+    n_channels = self._N_MEDIA_CHANNELS
+    linear_predictor_counterfactual_difference = backend.to_tensor(
+        backend.ones((1, self._N_GEOS_SMALL, self._N_TIMES_SMALL, n_channels)),
+        dtype=backend.float_dtype,
+    )
+    incremental_outcome_x = backend.to_tensor(
+        [[1.0] * n_channels], dtype=backend.float_dtype
+    )
+
+    def beta_x(eta_value, dev_value):
+      return eqn.calculate_beta_x(
+          is_non_media=False,
+          incremental_outcome_x=incremental_outcome_x,
+          linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
+          eta_x=backend.to_tensor(
+              [[eta_value] * n_channels], dtype=backend.float_dtype
+          ),
+          beta_gx_dev=backend.fill(
+              (1, self._N_GEOS_SMALL, n_channels),
+              backend.to_tensor(dev_value, dtype=backend.float_dtype),
+          ),
+      )
+
+    baseline = beta_x(0.0, 0.0)
+    shifted = beta_x(abs(shift), 1.0 if shift > 0 else -1.0)
+
+    self.assertTrue(np.all(np.isfinite(np.asarray(shifted))))
+    test_utils.assert_allclose(
+        shifted,
+        baseline - backend.to_tensor(shift, dtype=backend.float_dtype),
+        rtol=1e-4,
+    )
+
 
 class LinearPredictorCounterfactualDifferenceTest(
     test_utils.MeridianTestCase,

@@ -765,6 +765,13 @@ def _jax_roll(a, shift, axis=None):
   return jnp.roll(a, shift, axis=axis)
 
 
+def _jax_reduce_logsumexp(x, axis=None, keepdims=False):
+  """JAX implementation for reduce_logsumexp."""
+  from jax.scipy.special import logsumexp
+
+  return logsumexp(x, axis=axis, keepdims=keepdims)
+
+
 def _tf_roll(a, shift: Sequence[int], axis=None):
   """TensorFlow implementation for roll that handles axis=None."""
   import tensorflow as tf
@@ -1086,6 +1093,7 @@ if _BACKEND == config.Backend.JAX:
   ones_like = _ops.ones_like
   rank = _ops.ndim
   reduce_any = _ops.any
+  reduce_logsumexp = _jax_reduce_logsumexp
   reduce_max = _ops.max
   reduce_mean = _ops.mean
   reduce_min = _ops.min
@@ -1270,6 +1278,7 @@ elif _BACKEND == config.Backend.TENSORFLOW:
   ones_like = _ops.ones_like
   rank = _ops.rank
   reduce_any = _ops.reduce_any
+  reduce_logsumexp = _ops.reduce_logsumexp
   reduce_max = _ops.reduce_max
   reduce_mean = _ops.reduce_mean
   reduce_min = _ops.reduce_min

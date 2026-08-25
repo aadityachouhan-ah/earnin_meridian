@@ -38,6 +38,17 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
   saturation-curve scan + linear interpolation. Returns
   `MarginalCacOptimizationResults`. Media-only and non-revenue-mode-only;
   hard-fails on RF channels or revenue-mode KPI.
+* Fix non-finite `beta_m` / `beta_gm` in the log-normal branch of
+  `ModelEquations.calculate_beta_x`. The denominator summed
+  `exp(beta_gx_dev * eta_x)` over geos before taking its log, which in float32
+  overflows to `inf` once the exponent clears ~88 and underflows the whole sum
+  to `0` when the weights are small. The underflow gave `log(0) = -inf`, hence
+  `beta_m = +inf` and `beta_gm = exp(+inf) = inf` for every geo and channel on
+  that draw. Now computed as a `reduce_logsumexp` in log space -- same
+  quantity, no intermediate `exp`. Adds `backend.reduce_logsumexp`.
+  Observed on a 210-geo model where it silently killed one MCMC chain in three
+  (contiguous tail of draws, sampler itself healthy: acceptance 100% and log
+  density finite throughout), and got worse with more channels.
 
 ## [1.6.0] - 2026-04-29
 

@@ -411,9 +411,13 @@ class ModelEquations:
       return (incremental_outcome_x - numerator_term_x) / denominator_term_x
     # For log-normal random effects, beta_x and eta_x are not mean & std.
     # The parameterization is beta_gx ~ exp(beta_x + eta_x * N(0, 1)).
-    denominator_term_x = backend.einsum(
-        "...gx,...gx->...x",
-        incremental_outcome_gx_over_beta_gx,
-        backend.exp(beta_gx_dev * eta_x[..., backend.newaxis, :]),
+    # Kept in log space. Summing exp() over geos first overflows float32 once
+    # eta_x * beta_gx_dev clears ~88, and underflows the whole sum to zero when
+    # the weights are tiny -- that one gives log(0) = -inf, so beta_x = +inf and
+    # every downstream beta_gx draw is inf.
+    log_denominator_term_x = backend.reduce_logsumexp(
+        backend.log(incremental_outcome_gx_over_beta_gx)
+        + beta_gx_dev * eta_x[..., backend.newaxis, :],
+        axis=-2,
     )
-    return backend.log(incremental_outcome_x) - backend.log(denominator_term_x)
+    return backend.log(incremental_outcome_x) - log_denominator_term_x
