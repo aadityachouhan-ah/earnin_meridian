@@ -48,7 +48,12 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
   quantity, no intermediate `exp`. Adds `backend.reduce_logsumexp`.
   Observed on a 210-geo model where it silently killed one MCMC chain in three
   (contiguous tail of draws, sampler itself healthy: acceptance 100% and log
-  density finite throughout), and got worse with more channels.
+  density finite throughout), and got worse with more channels. Note this does
+  not make `beta_gm` unconditionally finite: a channel whose per-geo weights are
+  tiny still gives a large positive `beta_m` and overflows the separate
+  `exp(beta_m + eta_m * beta_gm_dev)` in `posterior_sampler`, which this change
+  leaves alone because at that point the coefficient is genuinely absurd rather
+  than mis-computed.
 
 ## [1.6.0] - 2026-04-29
 
